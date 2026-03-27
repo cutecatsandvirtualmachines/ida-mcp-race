@@ -292,8 +292,47 @@ def cmd_analyze(args):
         print(f"{Colors.RED}Error: IDA not found at {ida_exe}{Colors.END}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"{Colors.BLUE}Starting IDA analysis on: {binary}{Colors.END}")
-    proc = subprocess.Popen([ida_exe, "-A", binary])
+    # Check if IDB already exists - load it directly to avoid prompts
+    idb_path = binary + ".i64"
+    unpacked_files = [binary + ext for ext in ['.id0', '.id1', '.id2', '.nam', '.til']]
+    has_unpacked = any(os.path.exists(f) for f in unpacked_files)
+
+    if os.path.exists(idb_path):
+        target_path = idb_path
+        print(f"{Colors.BLUE}Loading existing IDB: {idb_path}{Colors.END}")
+
+        # Clean up unpacked database files to avoid "IDA did not close properly" dialog
+        for unpacked_file in unpacked_files:
+            if os.path.exists(unpacked_file):
+                try:
+                    os.remove(unpacked_file)
+                    print(f"  Cleaned up: {os.path.basename(unpacked_file)}")
+                except Exception as e:
+                    print(f"  Warning: Could not remove {unpacked_file}: {e}")
+    elif has_unpacked:
+        # Unpacked database exists but no packed .i64 - clean up and start fresh
+        print(f"{Colors.YELLOW}Found incomplete database, cleaning up...{Colors.END}")
+        for unpacked_file in unpacked_files:
+            if os.path.exists(unpacked_file):
+                try:
+                    os.remove(unpacked_file)
+                    print(f"  Removed: {os.path.basename(unpacked_file)}")
+                except Exception as e:
+                    print(f"  Warning: Could not remove {unpacked_file}: {e}")
+        # Also remove port file if exists
+        port_file = idb_path + ".mcp_port"
+        if os.path.exists(port_file):
+            try:
+                os.remove(port_file)
+            except:
+                pass
+        target_path = binary
+        print(f"{Colors.BLUE}Starting fresh IDA analysis on: {binary}{Colors.END}")
+    else:
+        target_path = binary
+        print(f"{Colors.BLUE}Starting IDA analysis on: {binary}{Colors.END}")
+
+    proc = subprocess.Popen([ida_exe, "-A", target_path])
     print(f"{Colors.GREEN}IDA started (PID: {proc.pid}){Colors.END}")
     print("Use 'ida-mcp.py wait' to wait for MCP server")
 
@@ -307,8 +346,25 @@ def cmd_analyze_headless(args):
         print(f"{Colors.RED}Error: IDA not found at {ida_exe}{Colors.END}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"{Colors.BLUE}Starting headless IDA analysis on: {binary}{Colors.END}")
-    proc = subprocess.Popen([ida_exe, "-A", "-B", binary])
+    # Check if IDB already exists - load it directly to avoid prompts
+    idb_path = binary + ".i64"
+    if os.path.exists(idb_path):
+        target_path = idb_path
+        print(f"{Colors.BLUE}Loading existing IDB (headless): {idb_path}{Colors.END}")
+
+        # Clean up unpacked database files
+        for ext in ['.id0', '.id1', '.id2', '.nam', '.til']:
+            unpacked_file = binary + ext
+            if os.path.exists(unpacked_file):
+                try:
+                    os.remove(unpacked_file)
+                except:
+                    pass
+    else:
+        target_path = binary
+        print(f"{Colors.BLUE}Starting headless IDA analysis on: {binary}{Colors.END}")
+
+    proc = subprocess.Popen([ida_exe, "-A", "-B", target_path])
     print(f"{Colors.GREEN}IDA started (PID: {proc.pid}){Colors.END}")
 
 
@@ -430,7 +486,7 @@ def cmd_restart(args):
         target_path = binary_path
         print(f"  Starting: {binary_path}")
 
-    proc = subprocess.Popen([ida_exe, target_path])
+    proc = subprocess.Popen([ida_exe, "-A", target_path])
     print(f"{Colors.GREEN}IDA restarted (new PID: {proc.pid}){Colors.END}")
     print(f"Use 'ida-mcp.py wait' to wait for MCP server")
 

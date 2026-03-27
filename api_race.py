@@ -558,8 +558,12 @@ def _find_all_handlers() -> Dict[str, Any]:
 @tool
 @ext("race")
 @idasync
-def race_analyze() -> Dict[str, Any]:
-    """Run full race condition analysis on the current binary.
+def race_analyze(quick: bool = False) -> Dict[str, Any]:
+    """Run race condition analysis on the current binary.
+
+    Args:
+        quick: If True, only analyze dispatch handlers and their direct callees.
+               Use this for large binaries (>5MB) to avoid timeout.
 
     Analyzes the driver for:
     - Use-After-Free races
@@ -937,6 +941,12 @@ def race_analyze() -> Dict[str, Any]:
     ref_inc = ["ObfReferenceObject", "ObReferenceObject", "InterlockedIncrement", "ExAcquireRundownProtection"]
     ref_dec = ["ObfDereferenceObject", "ObDereferenceObject", "InterlockedDecrement", "ExReleaseRundownProtection"]
 
+    # In quick mode, only analyze handler functions (not all functions)
+    if quick:
+        funcs_to_analyze = list(analyzed_funcs)  # Already analyzed handlers
+    else:
+        funcs_to_analyze = list(idautils.Functions())
+
     # Patterns that indicate cleanup/destructor functions (expected to have more decrements)
     cleanup_patterns = [
         "~",            # C++ destructor
@@ -959,7 +969,7 @@ def race_analyze() -> Dict[str, Any]:
         "Exit",
     ]
 
-    for func_ea in idautils.Functions():
+    for func_ea in funcs_to_analyze:
         func = ida_funcs.get_func(func_ea)
         if not func:
             continue
@@ -1109,7 +1119,7 @@ def race_analyze() -> Dict[str, Any]:
     # Find rundown issues
     rundown_acquire = ["ExAcquireRundownProtection", "ExAcquireRundownProtectionEx"]
 
-    for func_ea in idautils.Functions():
+    for func_ea in funcs_to_analyze:
         func = ida_funcs.get_func(func_ea)
         if not func:
             continue
@@ -1573,3 +1583,24 @@ def race_debug_handlers() -> Dict[str, Any]:
                         })
 
     return debug_info
+
+
+@tool
+@ext("race")
+@idasync
+def race_wait_analysis() -> Dict[str, Any]:
+    """Check if IDA's auto-analysis is complete.
+
+    Returns dict with:
+        - completed: True if analysis finished
+        - status: Current analysis status
+
+    Call this repeatedly until completed=True before running race_analyze.
+    """
+    import ida_auto
+
+    is_ok = ida_auto.auto_is_ok()
+    return {
+        "completed": is_ok,
+        "status": "Analysis complete" if is_ok else "Analysis still running"
+    }
