@@ -548,6 +548,27 @@ def _find_all_handlers() -> Dict[str, Any]:
                     if irp_name not in handlers["dispatch_handlers"]:
                         handlers["dispatch_handlers"][irp_name] = func_ea
 
+    # For DXGK display drivers, find Escape handlers (IOCTL equivalent)
+    # Also find other driver-specific IOCTL patterns
+    ioctl_patterns = [
+        "Escape",           # DXGK escape handlers
+        "HandleIoctl",      # Generic IOCTL handlers
+        "ProcessIoctl",
+        "IoControl",
+        "HandleRequest",
+        "ProcessRequest",
+    ]
+
+    for func_ea in idautils.Functions():
+        func_name = idc.get_name(func_ea)
+        if func_name:
+            for pattern in ioctl_patterns:
+                if pattern.lower() in func_name.lower():
+                    # Skip if it's a helper function (too small or has certain prefixes)
+                    func = ida_funcs.get_func(func_ea)
+                    if func and (func.end_ea - func.start_ea) > 0x50:  # Min 80 bytes
+                        handlers["ioctl_handlers"][func_name] = func_ea
+
     return handlers
 
 
@@ -950,6 +971,7 @@ def race_analyze(quick: bool = False) -> Dict[str, Any]:
     # Patterns that indicate cleanup/destructor functions (expected to have more decrements)
     cleanup_patterns = [
         "~",            # C++ destructor
+        "??1",          # MSVC destructor mangling (??1ClassName@@)
         "Cleanup",
         "Clean",
         "Free",
@@ -967,6 +989,8 @@ def race_analyze(quick: bool = False) -> Dict[str, Any]:
         "Dispose",
         "Term",         # Terminate
         "Exit",
+        "Unreference",  # Common in Windows drivers
+        "Dereference",
     ]
 
     for func_ea in funcs_to_analyze:
