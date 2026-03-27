@@ -610,7 +610,7 @@ def race_analyze() -> Dict[str, Any]:
                         results["globals"][hex(ea)] = name
                 ea = idc.next_head(ea, seg_end)
 
-    # Find IOCTL handlers from DeviceControl
+    # Find IOCTL handlers from DeviceControl (WDM drivers)
     device_control = None
     for name, addr_hex in results["dispatch_handlers"].items():
         if "DEVICE_CONTROL" in name:
@@ -632,6 +632,72 @@ def race_analyze() -> Dict[str, Any]:
                                     target = idc.get_operand_value(next_head, 0)
                                     if target and target != idc.BADADDR:
                                         results["ioctl_handlers"][hex(val)] = hex(target)
+
+    # For StorPort drivers, IOCTLs come through HwStartIo as SCSI passthrough
+    # Look for storage IOCTL codes in the callbacks
+    if results.get("driver_type") == "storport":
+        # Common storage IOCTL codes
+        storage_ioctls = {
+            0x002d1400: "IOCTL_STORAGE_QUERY_PROPERTY",
+            0x002d0c14: "IOCTL_STORAGE_GET_DEVICE_NUMBER",
+            0x002d4800: "IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES",
+            0x002d0018: "IOCTL_STORAGE_GET_HOTPLUG_INFO",
+            0x002d5140: "IOCTL_STORAGE_PROTOCOL_COMMAND",
+            0x004d0008: "IOCTL_SCSI_PASS_THROUGH",
+            0x004d0004: "IOCTL_SCSI_PASS_THROUGH_DIRECT",
+            0x004d0014: "IOCTL_SCSI_MINIPORT",
+        }
+
+        # Scan HwStartIo and related callbacks for IOCTL handling
+        for cb_name, cb_addr_hex in results.get("callbacks", {}).items():
+            if cb_name not in ["HwStartIo", "HwProcessServiceRequest", "HwBuildIo"]:
+                continue
+            try:
+                cb_addr = int(cb_addr_hex, 16) if isinstance(cb_addr_hex, str) else cb_addr_hex
+            except:
+                continue
+
+            func = ida_funcs.get_func(cb_addr)
+            if not func:
+                continue
+
+            # Scan function and its callees for IOCTL comparisons
+            funcs_to_scan = [cb_addr]
+            scanned = set()
+            depth = 0
+            while funcs_to_scan and depth < 3:
+                next_funcs = []
+                for scan_addr in funcs_to_scan:
+                    if scan_addr in scanned:
+                        continue
+                    scanned.add(scan_addr)
+
+                    scan_func = ida_funcs.get_func(scan_addr)
+                    if not scan_func:
+                        continue
+
+                    for head in idautils.FuncItems(scan_addr):
+                        mnem = idc.print_insn_mnem(head)
+                        if mnem == "cmp":
+                            val = idc.get_operand_value(head, 1)
+                            if val in storage_ioctls:
+                                # Found IOCTL comparison - find the handler
+                                ioctl_name = storage_ioctls[val]
+                                next_head = idc.next_head(head, scan_func.end_ea)
+                                if next_head != idc.BADADDR:
+                                    jmp_mnem = idc.print_insn_mnem(next_head)
+                                    if jmp_mnem in ["jz", "je", "jnz", "jne", "ja", "jb", "jbe", "jae"]:
+                                        target = idc.get_operand_value(next_head, 0)
+                                        if target and target != idc.BADADDR:
+                                            results["ioctl_handlers"][ioctl_name] = hex(target)
+                        elif mnem == "call":
+                            call_target = idc.get_operand_value(head, 0)
+                            if call_target and call_target != idc.BADADDR:
+                                if call_target not in scanned:
+                                    next_funcs.append(call_target)
+
+                funcs_to_scan = next_funcs
+                depth += 1
 
     # Analyze handlers for races
     analyzed_funcs = set()
@@ -1088,6 +1154,12 @@ def race_analyze() -> Dict[str, Any]:
         "refcount_issues": len(results["refcount_issues"]),
         "rundown_issues": len(results["rundown_issues"])
     }
+
+    # Add driver-specific notes
+    if results.get("driver_type") == "storport":
+        results["summary"]["note"] = "StorPort: IOCTLs come via SCSI passthrough in HwStartIo/HwBuildIo callbacks"
+    elif results.get("driver_type") == "ndis":
+        results["summary"]["note"] = "NDIS: IOCTLs come via MiniportOidRequest callback"
 
     _analysis_results = results
     return results
