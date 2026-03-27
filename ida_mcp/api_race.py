@@ -236,77 +236,216 @@ def _detect_driver_type() -> Dict[str, Any]:
 
 
 def _find_storport_handlers() -> Dict[str, int]:
-    """Find StorPort miniport callback handlers"""
+    """Find StorPort miniport callback handlers by pattern scanning"""
     handlers = {}
 
-    # Look for HW_INITIALIZATION_DATA setup
-    # These are typically set up in DriverEntry before StorPortInitialize
-
-    # Search for known callback function name patterns
+    # Method 1: Search by function name patterns (if symbols available)
     for func_ea in idautils.Functions():
         func_name = idc.get_name(func_ea)
-        if not func_name:
+        if not func_name or func_name.startswith("sub_"):
             continue
 
-        # Check against StorPort callback names
         for cb_name in STORPORT_CALLBACKS:
             if cb_name.lower() in func_name.lower():
                 handlers[cb_name] = func_ea
 
-        # Also check for common patterns
-        if "StartIo" in func_name or "HwStartIo" in func_name:
+        if "StartIo" in func_name:
             handlers["HwStartIo"] = func_ea
-        elif "BuildIo" in func_name or "HwBuildIo" in func_name:
+        elif "BuildIo" in func_name:
             handlers["HwBuildIo"] = func_ea
         elif "ProcessServiceRequest" in func_name:
             handlers["HwProcessServiceRequest"] = func_ea
 
-    # Search for StorPortInitialize calls and trace back to find callback assignments
+    # Method 2: Find StorPortInitialize calls and trace HW_INITIALIZATION_DATA
     for ea, name in _import_cache.items():
         if "StorPortInitialize" in name:
-            # Find xrefs to StorPortInitialize
             for xref in idautils.XrefsTo(ea):
                 func = ida_funcs.get_func(xref.frm)
                 if func:
-                    # The 3rd argument (r8) contains HW_INITIALIZATION_DATA pointer
-                    # Analyze the function to find callback assignments
-                    _analyze_hw_init_data(func.start_ea, handlers)
+                    _analyze_hw_init_data_via_stack(func.start_ea, xref.frm, handlers)
+
+    # Method 3: Scan for callback patterns by heuristics
+    if not handlers.get("HwStartIo"):
+        _scan_for_callback_table(handlers)
 
     return handlers
 
 
-def _analyze_hw_init_data(func_ea: int, handlers: Dict[str, int]):
-    """Analyze function to find HW_INITIALIZATION_DATA callback assignments"""
+def _analyze_hw_init_data_via_stack(func_ea: int, call_site: int, handlers: Dict[str, int]):
+    """Analyze HW_INITIALIZATION_DATA setup on stack before StorPortInitialize call.
+
+    StorPort drivers typically use a lea+mov pattern:
+    1. lea rax, callback_func
+    2. mov [rsp+base+offset], rax
+
+    Where offset corresponds to HW_INITIALIZATION_DATA callback fields.
+    """
+    import re
     func = ida_funcs.get_func(func_ea)
     if not func:
         return
 
-    # StorPort HW_INITIALIZATION_DATA callback offsets (x64)
-    # These vary by structure version but common offsets:
+    # Map of callback offsets from base of structure
     callback_offsets = {
-        0x08: "HwFindAdapter",
-        0x10: "HwInitialize",
-        0x18: "HwStartIo",
-        0x20: "HwInterrupt",
+        0x08: "HwInitialize",
+        0x10: "HwStartIo",
+        0x18: "HwInterrupt",
+        0x20: "HwFindAdapter",
         0x28: "HwResetBus",
-        0x30: "HwAdapterControl",
-        0x38: "HwBuildIo",
-        0x78: "HwProcessServiceRequest",
-        0x80: "HwCompleteServiceIrp",
+        0x30: "HwDmaStarted",
+        0x38: "HwAdapterState",
+        0x78: "HwBuildIo",
+        0x80: "HwFreeAdapterResources",
+        0x88: "HwProcessServiceRequest",
+        0x90: "HwCompleteServiceIrp",
     }
+
+    # Step 1: Find the base stack offset of HW_INITIALIZATION_DATA
+    # Look for: lea r8, [rsp+XXh+var_YYY]
+    base_stack_offset = 0x20  # Default
+    structure_var_base = None
+
+    current = call_site
+    for _ in range(30):
+        current = idc.prev_head(current, func.start_ea)
+        if current == idc.BADADDR:
+            break
+        mnem = idc.print_insn_mnem(current)
+        if mnem == "lea":
+            op0 = idc.print_operand(current, 0).lower()
+            op1 = idc.print_operand(current, 1)
+            # r8 is 3rd argument in x64 calling convention
+            if "r8" in op0 and "rsp" in op1.lower():
+                # Extract var name like var_1A8 from [rsp+1C8h+var_1A8]
+                var_match = re.search(r'var_([0-9a-fA-F]+)', op1)
+                if var_match:
+                    structure_var_base = int(var_match.group(1), 16)
+                break
+
+    # Step 2: Scan function for lea+mov pairs
+    # Track: lea reg, func_addr; mov [stack], reg
+    pending_lea = {}  # reg -> func_ea
 
     for head in idautils.FuncItems(func_ea):
         mnem = idc.print_insn_mnem(head)
-        if mnem in ["mov", "lea"]:
-            disasm = idc.GetDisasm(head)
-            # Look for patterns like mov [rbp+offset], func_addr
-            for offset, cb_name in callback_offsets.items():
-                if f"+{offset:X}h]" in disasm.upper() or f"+0x{offset:X}]" in disasm.upper():
-                    target = idc.get_operand_value(head, 1)
-                    if target and target != idc.BADADDR:
-                        func_at = ida_funcs.get_func(target)
-                        if func_at:
-                            handlers[cb_name] = target
+
+        if mnem == "lea":
+            op0 = idc.print_operand(head, 0).lower()
+            op1_val = idc.get_operand_value(head, 1)
+
+            if op1_val and op1_val != idc.BADADDR:
+                target_func = ida_funcs.get_func(op1_val)
+                if target_func:
+                    pending_lea[op0] = op1_val
+
+        elif mnem == "mov":
+            op0 = idc.print_operand(head, 0)
+            op1 = idc.print_operand(head, 1).lower()
+
+            # Check if storing from a tracked register to stack
+            if op1 not in pending_lea:
+                continue
+            if "rsp" not in op0.lower() and "rbp" not in op0.lower():
+                continue
+
+            func_ptr = pending_lea[op1]
+
+            # Extract var name from destination like [rsp+1C8h+var_1A0]
+            var_match = re.search(r'var_([0-9a-fA-F]+)', op0)
+            if not var_match:
+                continue
+
+            dest_var = int(var_match.group(1), 16)
+
+            # Calculate offset from structure base
+            # If base is var_1A8 and dest is var_1A0, offset = 1A8 - 1A0 = 8
+            if structure_var_base is not None:
+                rel_offset = structure_var_base - dest_var
+            else:
+                # Fallback: assume typical layout
+                # var_1A8 = base, var_1A0 = +8, var_198 = +16, etc.
+                # Common pattern: base around 0x1A8, decreasing var names = increasing offset
+                rel_offset = 0x1A8 - dest_var  # Heuristic
+
+            # Check if this matches a known callback offset
+            for cb_offset, cb_name in callback_offsets.items():
+                if rel_offset == cb_offset:
+                    if cb_name not in handlers:
+                        handlers[cb_name] = func_ptr
+                    break
+
+
+def _scan_for_callback_table(handlers: Dict[str, int]):
+    """Scan for callback table pattern without relying on StorPortInitialize.
+
+    Heuristic: Look for functions that write multiple function pointers to
+    consecutive stack/structure offsets. This is typical of callback table setup.
+    """
+    best_candidate = None
+    best_count = 0
+
+    for func_ea in idautils.Functions():
+        func = ida_funcs.get_func(func_ea)
+        if not func:
+            continue
+
+        # Skip small functions
+        if func.end_ea - func.start_ea < 100:
+            continue
+
+        func_ptr_writes = []
+
+        for head in idautils.FuncItems(func_ea):
+            mnem = idc.print_insn_mnem(head)
+            if mnem != "mov":
+                continue
+
+            op0 = idc.print_operand(head, 0)
+            op1_val = idc.get_operand_value(head, 1)
+
+            # Check if writing to memory (stack or global)
+            if "[" not in op0:
+                continue
+
+            # Check if value is a function address
+            if not op1_val or op1_val == idc.BADADDR:
+                continue
+            target_func = ida_funcs.get_func(op1_val)
+            if not target_func:
+                continue
+
+            # Extract offset if stack-relative
+            import re
+            match = re.search(r'\[(rsp|rbp)\+([0-9a-fA-F]+)h?\]', op0, re.IGNORECASE)
+            if match:
+                offset = int(match.group(2), 16)
+                func_ptr_writes.append((head, offset, op1_val))
+
+        # Track function with most callback-like writes
+        if len(func_ptr_writes) > best_count:
+            best_count = len(func_ptr_writes)
+            best_candidate = func_ptr_writes
+
+    # If we found a good candidate, try to map callbacks by offset patterns
+    if best_candidate and best_count >= 5:
+        # Sort by offset
+        best_candidate.sort(key=lambda x: x[1])
+
+        # Common HW_INIT_DATA offsets (relative to structure base)
+        # Map by relative position in sorted list
+        callback_map = [
+            "HwInitialize",      # Usually first callback
+            "HwStartIo",         # Second - main I/O handler
+            "HwInterrupt",       # Third
+            "HwFindAdapter",     # Fourth
+            "HwResetBus",        # Fifth
+        ]
+
+        for i, (addr, offset, func_ptr) in enumerate(best_candidate):
+            if i < len(callback_map):
+                cb_name = callback_map[i]
+                if cb_name not in handlers:
+                    handlers[cb_name] = func_ptr
 
 
 def _find_ndis_handlers() -> Dict[str, int]:
@@ -1094,3 +1233,83 @@ def race_get_full_results() -> Dict[str, Any]:
         return {"error": "No analysis results. Run race_analyze first."}
 
     return _analysis_results
+
+
+@tool
+@ext("race")
+@idasync
+def race_debug_handlers() -> Dict[str, Any]:
+    """Debug handler detection - shows what the detection logic finds.
+
+    Use this to troubleshoot why callbacks aren't being detected.
+    """
+    _build_import_cache()
+
+    debug_info = {
+        "import_cache_size": len(_import_cache),
+        "storport_imports": [],
+        "storport_xrefs": [],
+        "iaStorVD_Initialize": None,
+        "func_ptr_writes_in_init": [],
+        "lea_mov_pairs": [],
+    }
+
+    # Check imports for StorPort
+    for ea, name in _import_cache.items():
+        if "stor" in name.lower():
+            debug_info["storport_imports"].append({"ea": hex(ea), "name": name})
+            if "StorPortInitialize" in name:
+                # Get xrefs
+                for xref in idautils.XrefsTo(ea):
+                    func = ida_funcs.get_func(xref.frm)
+                    func_name = idc.get_name(func.start_ea) if func else "unknown"
+                    debug_info["storport_xrefs"].append({
+                        "call_site": hex(xref.frm),
+                        "in_function": func_name,
+                        "func_start": hex(func.start_ea) if func else None
+                    })
+
+    # Find iaStorVD_Initialize
+    init_ea = idc.get_name_ea_simple("iaStorVD_Initialize")
+    if init_ea != idc.BADADDR:
+        debug_info["iaStorVD_Initialize"] = hex(init_ea)
+
+        # Scan for lea/mov pairs that set up callback table
+        # Pattern: lea rax, sub_XXX; mov [rsp+...], rax
+        func = ida_funcs.get_func(init_ea)
+        if func:
+            import re
+            pending_lea = {}  # reg -> (addr, func_ptr)
+
+            for head in idautils.FuncItems(init_ea):
+                mnem = idc.print_insn_mnem(head)
+
+                if mnem == "lea":
+                    op0 = idc.print_operand(head, 0).lower()
+                    op1_val = idc.get_operand_value(head, 1)
+                    if op1_val and op1_val != idc.BADADDR:
+                        target_func = ida_funcs.get_func(op1_val)
+                        if target_func:
+                            # Store pending lea
+                            pending_lea[op0] = (head, op1_val)
+
+                elif mnem == "mov":
+                    op0 = idc.print_operand(head, 0)
+                    op1 = idc.print_operand(head, 1).lower()
+
+                    # Check if storing from a register we tracked
+                    if op1 in pending_lea and ("rsp" in op0.lower() or "rbp" in op0.lower()):
+                        lea_addr, func_ptr = pending_lea[op1]
+                        func_name = idc.get_name(func_ptr) or f"sub_{func_ptr:X}"
+
+                        # Try to extract stack offset from IDA's format: [rsp+1C8h+var_XXX]
+                        # The actual offset is stored in var_XXX name or can be calculated
+                        debug_info["lea_mov_pairs"].append({
+                            "lea_addr": hex(lea_addr),
+                            "mov_addr": hex(head),
+                            "dest": op0,
+                            "func_ptr": hex(func_ptr),
+                            "func_name": func_name
+                        })
+
+    return debug_info

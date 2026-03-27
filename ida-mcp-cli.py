@@ -22,15 +22,64 @@ class Colors:
     END = '\033[0m' if os.name != 'nt' or 'WT_SESSION' in os.environ else ''
 
 
+def get_running_ida_pids():
+    """Get list of actually running IDA process PIDs (Windows)."""
+    pids = []
+    for exe_name in ['ida64.exe', 'idat64.exe']:
+        try:
+            result = subprocess.run(
+                ['tasklist', '/FI', f'IMAGENAME eq {exe_name}', '/FO', 'CSV', '/NH'],
+                capture_output=True, text=True
+            )
+            for line in result.stdout.strip().split('\n'):
+                if line and exe_name.lower() in line.lower():
+                    parts = line.split(',')
+                    if len(parts) >= 2:
+                        pid = parts[1].strip('"')
+                        try:
+                            pids.append(int(pid))
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+    return pids
+
+
 def get_servers():
-    """Load server registry."""
+    """Load server registry, filtering out dead processes."""
     if not os.path.exists(MCP_REGISTRY):
         return {}
     try:
         with open(MCP_REGISTRY) as f:
-            return json.load(f)
+            servers = json.load(f)
     except (json.JSONDecodeError, IOError):
         return {}
+
+    # Filter out PIDs that are no longer running
+    running_pids = get_running_ida_pids()
+    live_servers = {}
+    for pid_str, info in servers.items():
+        try:
+            pid_int = int(pid_str)
+            if pid_int in running_pids:
+                live_servers[pid_str] = info
+        except ValueError:
+            pass
+
+    # Update registry if we removed stale entries
+    if len(live_servers) != len(servers):
+        save_servers(live_servers)
+
+    return live_servers
+
+
+def save_servers(servers):
+    """Save server registry."""
+    try:
+        with open(MCP_REGISTRY, 'w') as f:
+            json.dump(servers, f, indent=2)
+    except IOError:
+        pass
 
 
 def get_port(identifier=None):
@@ -108,9 +157,18 @@ def cmd_servers(args):
         return
 
     print(f"{Colors.BLUE}Running IDA MCP servers:{Colors.END}")
-    for pid, info in servers.items():
+    print(f"{'PID':<8} {'Port':<6} {'Binary/IDB'}")
+    print("-" * 60)
+    for i, (pid, info) in enumerate(servers.items()):
         idb = info.get('idb', 'N/A')
-        print(f"  PID {pid}: port={info['port']} idb={idb}")
+        # Shorten path for display
+        if idb and len(idb) > 45:
+            idb = "..." + idb[-42:]
+        port = info['port']
+        marker = "*" if i == 0 else " "
+        print(f"{marker}{pid:<7} {port:<6} {idb}")
+
+    print(f"\n{Colors.YELLOW}* = default (use -p PORT to target specific instance){Colors.END}")
 
 
 def cmd_port(args):
@@ -252,6 +310,178 @@ def cmd_analyze_headless(args):
     print(f"{Colors.BLUE}Starting headless IDA analysis on: {binary}{Colors.END}")
     proc = subprocess.Popen([ida_exe, "-A", "-B", binary])
     print(f"{Colors.GREEN}IDA started (PID: {proc.pid}){Colors.END}")
+
+
+def cmd_stop(args):
+    """Stop IDA instance(s)."""
+    servers = get_servers()  # Already filters dead PIDs
+    running_pids = get_running_ida_pids()
+
+    if not running_pids and not servers:
+        print(f"{Colors.YELLOW}No IDA processes running{Colors.END}")
+        return
+
+    stopped = []
+
+    if args.pid:
+        # Stop specific PID
+        pids_to_stop = [int(args.pid)]
+    elif args.all:
+        # Stop all running IDA processes
+        pids_to_stop = running_pids
+    elif running_pids:
+        # Stop first running instance
+        pids_to_stop = [running_pids[0]]
+    else:
+        print(f"{Colors.YELLOW}No IDA processes to stop{Colors.END}")
+        return
+
+    for pid in pids_to_stop:
+        try:
+            subprocess.run(['taskkill', '/F', '/PID', str(pid)],
+                         capture_output=True, check=True)
+            stopped.append(pid)
+            print(f"{Colors.GREEN}Stopped IDA (PID: {pid}){Colors.END}")
+        except (subprocess.CalledProcessError, OSError) as e:
+            print(f"{Colors.RED}Failed to stop PID {pid}: {e}{Colors.END}")
+
+    # Clean up registry and port files
+    if stopped:
+        time.sleep(0.5)
+        for pid in stopped:
+            pid_str = str(pid)
+            if pid_str in servers:
+                info = servers[pid_str]
+                if info.get('idb'):
+                    port_file = f"{info['idb']}.mcp_port"
+                    if os.path.exists(port_file):
+                        try:
+                            os.remove(port_file)
+                        except:
+                            pass
+
+
+def cmd_restart(args):
+    """Restart IDA with the same binary."""
+    servers = get_servers()  # Already filters dead PIDs
+    running_pids = get_running_ida_pids()
+
+    binary_path = None
+    pid_to_kill = None
+
+    if args.pid:
+        # Specific PID requested
+        pid_to_kill = int(args.pid)
+        if str(pid_to_kill) in servers:
+            info = servers[str(pid_to_kill)]
+            binary_path = _derive_binary_from_idb(info.get('idb'))
+    elif servers:
+        # Use first registered server
+        pid_to_kill = int(list(servers.keys())[0])
+        info = servers[str(pid_to_kill)]
+        binary_path = _derive_binary_from_idb(info.get('idb'))
+    elif running_pids:
+        # No registry, but IDA is running - just kill it
+        pid_to_kill = running_pids[0]
+        print(f"{Colors.YELLOW}Warning: No server registry, will kill IDA PID {pid_to_kill} but need binary path{Colors.END}")
+
+    if not binary_path:
+        print(f"{Colors.RED}Cannot determine binary path. Use 'analyze <binary>' instead.{Colors.END}")
+        sys.exit(1)
+
+    print(f"{Colors.BLUE}Restarting IDA...{Colors.END}")
+
+    # Kill any running IDA instances (more aggressive cleanup)
+    killed = False
+    for pid in running_pids:
+        try:
+            print(f"  Stopping PID: {pid}")
+            subprocess.run(['taskkill', '/F', '/PID', str(pid)],
+                         capture_output=True, check=True)
+            killed = True
+        except Exception:
+            pass
+
+    if killed:
+        time.sleep(1.5)  # Give Windows time to release resources
+
+    # Start new instance - prefer loading existing IDB to avoid prompts
+    ida_exe = os.path.join(IDA_PATH, "ida64.exe")
+
+    # Check if IDB exists - if so, open it directly to avoid "Load existing?" prompt
+    idb_path = binary_path + ".i64"
+    if os.path.exists(idb_path):
+        target_path = idb_path
+        print(f"  Loading existing IDB: {idb_path}")
+    else:
+        target_path = binary_path
+        print(f"  Starting: {binary_path}")
+
+    proc = subprocess.Popen([ida_exe, target_path])
+    print(f"{Colors.GREEN}IDA restarted (new PID: {proc.pid}){Colors.END}")
+    print(f"Use 'ida-mcp.py wait' to wait for MCP server")
+
+
+def _derive_binary_from_idb(idb_path):
+    """Derive original binary path from IDB path."""
+    if not idb_path:
+        return None
+
+    binary_path = None
+    for ext in ['.i64', '.idb']:
+        if idb_path.endswith(ext):
+            potential = idb_path[:-len(ext)]
+            for bin_ext in ['', '.sys', '.exe', '.dll', '.drv']:
+                check_path = potential + bin_ext
+                if os.path.exists(check_path):
+                    binary_path = check_path
+                    break
+            if binary_path:
+                break
+
+    return binary_path or idb_path
+
+
+def cmd_kill_all(args):
+    """Kill all IDA processes (Windows)."""
+    # Get IDA64 processes
+    result = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq ida64.exe', '/FO', 'CSV', '/NH'],
+                           capture_output=True, text=True)
+    pids = []
+    for line in result.stdout.strip().split('\n'):
+        if line and 'ida64.exe' in line.lower():
+            parts = line.split(',')
+            if len(parts) >= 2:
+                pid = parts[1].strip('"')
+                pids.append(pid)
+
+    # Also check idat64 (headless)
+    result = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq idat64.exe', '/FO', 'CSV', '/NH'],
+                           capture_output=True, text=True)
+    for line in result.stdout.strip().split('\n'):
+        if line and 'idat64.exe' in line.lower():
+            parts = line.split(',')
+            if len(parts) >= 2:
+                pid = parts[1].strip('"')
+                pids.append(pid)
+
+    if not pids:
+        print(f"{Colors.YELLOW}No IDA processes found{Colors.END}")
+        return
+
+    for pid in pids:
+        try:
+            subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True, check=True)
+            print(f"{Colors.GREEN}Killed IDA (PID: {pid}){Colors.END}")
+        except:
+            print(f"{Colors.RED}Failed to kill PID {pid}{Colors.END}")
+
+    # Clean up registry
+    if os.path.exists(MCP_REGISTRY):
+        try:
+            os.remove(MCP_REGISTRY)
+        except:
+            pass
 
 
 # ============================================================
@@ -438,6 +668,16 @@ def main():
     p = subparsers.add_parser('analyze-headless', help='Start headless IDA analysis')
     p.add_argument('binary', help='Binary file path')
 
+    # Process management commands
+    p = subparsers.add_parser('stop', help='Stop IDA instance')
+    p.add_argument('pid', nargs='?', help='PID to stop (default: first running)')
+    p.add_argument('-a', '--all', action='store_true', help='Stop all IDA instances')
+
+    p = subparsers.add_parser('restart', help='Restart IDA with same binary')
+    p.add_argument('pid', nargs='?', help='PID to restart (default: first running)')
+
+    subparsers.add_parser('kill-all', help='Kill all IDA processes')
+
     # Race detection commands
     subparsers.add_parser('race-analyze', help='Run race condition analysis')
     subparsers.add_parser('race-summary', help='Get race analysis summary')
@@ -483,6 +723,9 @@ def main():
         'race-handlers': cmd_race_handlers,
         'race-func': cmd_race_func,
         'race-full': cmd_race_full,
+        'stop': cmd_stop,
+        'restart': cmd_restart,
+        'kill-all': cmd_kill_all,
     }
 
     if args.command in commands:
