@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.i64
+*.idb
+*.til
+*.id0
+*.id1
+*.id2
+*.nam
+*.mcp_port
+.ida_mcp_servers.json
