@@ -460,7 +460,7 @@ def race_analyze() -> Dict[str, Any]:
         seg_name = ida_segment.get_segm_name(seg)
 
         if seg_name in [".data", ".bss", "DATA", "BSS", ".rdata"]:
-            seg_end = ida_segment.get_segm_end(seg_ea)
+            seg_end = idc.get_segm_end(seg_ea)
             ea = seg_ea
 
             while ea < seg_end and ea != idc.BADADDR:
