@@ -110,8 +110,15 @@ def get_port(identifier=None):
     return None
 
 
-def mcp_call(method, params=None, port=None):
-    """Make an MCP JSON-RPC call."""
+def mcp_call(method, params=None, port=None, extensions=None):
+    """Make an MCP JSON-RPC call.
+
+    Args:
+        method: The RPC method to call
+        params: Optional parameters for the method
+        port: Server port (auto-detected if None)
+        extensions: List of extensions to enable (e.g., ['race', 'dbg'])
+    """
     if port is None:
         port = get_port()
     if port is None:
@@ -125,7 +132,12 @@ def mcp_call(method, params=None, port=None):
         "id": 1
     }
 
+    # Build URL with extension query param if needed
     url = f"http://127.0.0.1:{port}/mcp"
+    if extensions:
+        ext_str = ",".join(extensions)
+        url = f"{url}?ext={ext_str}"
+
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode('utf-8'),
@@ -144,9 +156,16 @@ def mcp_call(method, params=None, port=None):
         return None
 
 
-def mcp_tool(tool_name, arguments=None, port=None):
-    """Call an MCP tool."""
-    return mcp_call("tools/call", {"name": tool_name, "arguments": arguments or {}}, port)
+def mcp_tool(tool_name, arguments=None, port=None, extensions=None):
+    """Call an MCP tool.
+
+    Args:
+        tool_name: Name of the tool to call
+        arguments: Tool arguments
+        port: Server port
+        extensions: List of extensions to enable (e.g., ['race'])
+    """
+    return mcp_call("tools/call", {"name": tool_name, "arguments": arguments or {}}, port, extensions)
 
 
 def cmd_servers(args):
@@ -560,7 +579,7 @@ def cmd_kill_all(args):
 def cmd_race_analyze(args):
     """Run race condition analysis."""
     print(f"{Colors.BLUE}Running race condition analysis...{Colors.END}")
-    result = mcp_tool("race_analyze", {}, port=getattr(args, 'port', None))
+    result = mcp_tool("race_analyze", {}, port=getattr(args, 'port', None), extensions=['race'])
     if not result:
         return
 
@@ -581,7 +600,7 @@ def cmd_race_analyze(args):
 
 def cmd_race_summary(args):
     """Get race analysis summary."""
-    result = mcp_tool("race_get_summary", {}, port=getattr(args, 'port', None))
+    result = mcp_tool("race_get_summary", {}, port=getattr(args, 'port', None), extensions=['race'])
     if not result:
         return
     print(json.dumps(result.get('result', {}).get('structuredContent', {}), indent=2))
@@ -593,7 +612,7 @@ def cmd_race_list(args):
     if args.severity:
         params['severity'] = args.severity
 
-    result = mcp_tool("race_get_races", params, port=getattr(args, 'port', None))
+    result = mcp_tool("race_get_races", params, port=getattr(args, 'port', None), extensions=['race'])
     if not result:
         return
 
@@ -612,13 +631,20 @@ def cmd_race_list(args):
 
 def cmd_race_toctou(args):
     """List TOCTOU vulnerabilities."""
-    result = mcp_tool("race_get_toctou", {}, port=getattr(args, 'port', None))
+    result = mcp_tool("race_get_toctou", {}, port=getattr(args, 'port', None), extensions=['race'])
     if not result:
         return
 
-    issues = result.get('result', {}).get('structuredContent', [])
+    sc = result.get('result', {}).get('structuredContent', {})
+    issues = sc.get('result', sc) if isinstance(sc, dict) else sc
+    if isinstance(issues, dict):
+        issues = [issues]
     for i, issue in enumerate(issues, 1):
+        if isinstance(issue, str):
+            print(issue)
+            continue
         print(f"\n{Colors.YELLOW}[{i}] TOCTOU in {issue.get('function_name', '')}{Colors.END}")
+        print(f"    Function: {issue.get('function', '')}")
         print(f"    Check: {issue.get('check_type', '')} @ {issue.get('check_address', '')}")
         print(f"    Use: {issue.get('use_type', '')} @ {issue.get('use_address', '')}")
         print(f"    Gap: {issue.get('gap_instructions', 0)} instructions")
@@ -626,34 +652,49 @@ def cmd_race_toctou(args):
 
 def cmd_race_refcount(args):
     """List refcount issues."""
-    result = mcp_tool("race_get_refcount", {}, port=getattr(args, 'port', None))
+    result = mcp_tool("race_get_refcount", {}, port=getattr(args, 'port', None), extensions=['race'])
     if not result:
         return
 
-    issues = result.get('result', {}).get('structuredContent', [])
-    for issue in issues:
-        print(f"\n{Colors.YELLOW}Refcount issue in {issue.get('function_name', '')}{Colors.END}")
+    sc = result.get('result', {}).get('structuredContent', {})
+    issues = sc.get('result', sc) if isinstance(sc, dict) else sc
+    if isinstance(issues, dict):
+        issues = [issues]
+    for i, issue in enumerate(issues, 1):
+        if isinstance(issue, str):
+            print(issue)
+            continue
+        print(f"\n{Colors.YELLOW}[{i}] Refcount issue in {issue.get('function_name', '')}{Colors.END}")
+        print(f"    Function: {issue.get('function', '')}")
         print(f"    Type: {issue.get('issue_type', '')}")
         print(f"    Increments: {issue.get('increments', 0)}, Decrements: {issue.get('decrements', 0)}")
+        print(f"    Severity: {issue.get('severity', 'unknown')}")
 
 
 def cmd_race_rundown(args):
     """List rundown protection issues."""
-    result = mcp_tool("race_get_rundown", {}, port=getattr(args, 'port', None))
+    result = mcp_tool("race_get_rundown", {}, port=getattr(args, 'port', None), extensions=['race'])
     if not result:
         return
 
-    issues = result.get('result', {}).get('structuredContent', [])
-    for issue in issues:
-        print(f"\n{Colors.YELLOW}Rundown issue in {issue.get('function_name', '')}{Colors.END}")
+    sc = result.get('result', {}).get('structuredContent', {})
+    issues = sc.get('result', sc) if isinstance(sc, dict) else sc
+    if isinstance(issues, dict):
+        issues = [issues]
+    for i, issue in enumerate(issues, 1):
+        if isinstance(issue, str):
+            print(issue)
+            continue
+        print(f"\n{Colors.YELLOW}[{i}] Rundown issue in {issue.get('function_name', '')}{Colors.END}")
+        print(f"    Function: {issue.get('function', '')}")
         print(f"    Type: {issue.get('issue_type', '')}")
-        print(f"    Address: {issue.get('address', '')}")
-        print(f"    Details: {issue.get('details', '')}")
+        print(f"    Acquires: {issue.get('acquires', 0)}, Releases: {issue.get('releases', 0)}")
+        print(f"    Severity: {issue.get('severity', 'unknown')}")
 
 
 def cmd_race_handlers(args):
     """List dispatch/IOCTL handlers."""
-    result = mcp_tool("race_get_handlers", {}, port=getattr(args, 'port', None))
+    result = mcp_tool("race_get_handlers", {}, port=getattr(args, 'port', None), extensions=['race'])
     if not result:
         return
 
@@ -670,7 +711,7 @@ def cmd_race_handlers(args):
 
 def cmd_race_func(args):
     """Analyze a specific function for races."""
-    result = mcp_tool("race_analyze_function", {"address": args.address}, port=getattr(args, 'port', None))
+    result = mcp_tool("race_analyze_function", {"address": args.address}, port=getattr(args, 'port', None), extensions=['race'])
     if not result:
         return
 
@@ -679,7 +720,7 @@ def cmd_race_func(args):
 
 def cmd_race_full(args):
     """Get full race analysis results."""
-    result = mcp_tool("race_get_full_results", {}, port=getattr(args, 'port', None))
+    result = mcp_tool("race_get_full_results", {}, port=getattr(args, 'port', None), extensions=['race'])
     if not result:
         return
 
