@@ -100,6 +100,46 @@ IRP_DISPATCH_NAMES = {
     18: "IRP_MJ_CLEANUP", 22: "IRP_MJ_POWER", 23: "IRP_MJ_SYSTEM_CONTROL", 27: "IRP_MJ_PNP"
 }
 
+# Driver entry point patterns for different driver types
+DRIVER_ENTRY_PATTERNS = [
+    # Standard WDM/KMDF
+    "DriverEntry", "GsDriverEntry", "FxDriverEntry",
+    # StorPort miniport
+    "StorPortInitialize", "iaStorVD_Initialize", "HwInitialize",
+    # NDIS miniport
+    "NdisMRegisterMiniportDriver", "DriverEntry",
+    # WDF
+    "WdfDriverCreate",
+    # Filter drivers
+    "FltRegisterFilter",
+]
+
+# StorPort miniport callback names
+STORPORT_CALLBACKS = [
+    "HwFindAdapter", "HwInitialize", "HwStartIo", "HwInterrupt",
+    "HwResetBus", "HwAdapterControl", "HwBuildIo", "HwFreeAdapterResources",
+    "HwProcessServiceRequest", "HwCompleteServiceIrp", "HwInitializeTracing",
+    "HwCleanupTracing", "HwTracingEnabled", "HwUnitControl", "HwStateChange"
+]
+
+# NDIS miniport callback names
+NDIS_CALLBACKS = [
+    "MiniportInitializeEx", "MiniportHaltEx", "MiniportPause", "MiniportRestart",
+    "MiniportOidRequest", "MiniportSendNetBufferLists", "MiniportReturnNetBufferLists",
+    "MiniportCancelSend", "MiniportDevicePnPEventNotify", "MiniportShutdownEx",
+    "MiniportCheckForHangEx", "MiniportResetEx", "MiniportCancelOidRequest",
+    "MiniportDirectOidRequest", "MiniportCancelDirectOidRequest"
+]
+
+# Patterns to identify driver type from strings/imports
+DRIVER_TYPE_INDICATORS = {
+    "storport": ["StorPort", "STOR_", "HW_INITIALIZATION_DATA", "iaStorVD", "NvmePort"],
+    "ndis": ["NDIS", "Ndis", "MINIPORT_", "NET_BUFFER"],
+    "wdf": ["Wdf", "WDF_", "WDFDRIVER", "WDFDEVICE"],
+    "filter": ["Flt", "FLT_", "PFLT_", "FilterDriver"],
+    "wdm": ["IoCreateDevice", "IRP_MJ_", "DriverObject->MajorFunction"]
+}
+
 # ============================================================
 # Global State for Analysis Results
 # ============================================================
@@ -155,6 +195,223 @@ def _get_call_arg(call_addr: int, arg_num: int) -> str:
     return f"<{reg}>"
 
 
+def _detect_driver_type() -> Dict[str, Any]:
+    """Detect the type of driver from imports and strings"""
+    driver_info = {
+        "type": "unknown",
+        "indicators": [],
+        "entry_points": []
+    }
+
+    # Check imports
+    for ea, name in _import_cache.items():
+        for dtype, patterns in DRIVER_TYPE_INDICATORS.items():
+            for pattern in patterns:
+                if pattern.lower() in name.lower():
+                    if dtype not in driver_info["indicators"]:
+                        driver_info["indicators"].append(dtype)
+
+    # Check strings
+    for s in idautils.Strings():
+        str_val = str(s)
+        for dtype, patterns in DRIVER_TYPE_INDICATORS.items():
+            for pattern in patterns:
+                if pattern in str_val:
+                    if dtype not in driver_info["indicators"]:
+                        driver_info["indicators"].append(dtype)
+
+    # Determine primary type
+    if "storport" in driver_info["indicators"]:
+        driver_info["type"] = "storport"
+    elif "ndis" in driver_info["indicators"]:
+        driver_info["type"] = "ndis"
+    elif "filter" in driver_info["indicators"]:
+        driver_info["type"] = "filter"
+    elif "wdf" in driver_info["indicators"]:
+        driver_info["type"] = "wdf"
+    else:
+        driver_info["type"] = "wdm"
+
+    return driver_info
+
+
+def _find_storport_handlers() -> Dict[str, int]:
+    """Find StorPort miniport callback handlers"""
+    handlers = {}
+
+    # Look for HW_INITIALIZATION_DATA setup
+    # These are typically set up in DriverEntry before StorPortInitialize
+
+    # Search for known callback function name patterns
+    for func_ea in idautils.Functions():
+        func_name = idc.get_name(func_ea)
+        if not func_name:
+            continue
+
+        # Check against StorPort callback names
+        for cb_name in STORPORT_CALLBACKS:
+            if cb_name.lower() in func_name.lower():
+                handlers[cb_name] = func_ea
+
+        # Also check for common patterns
+        if "StartIo" in func_name or "HwStartIo" in func_name:
+            handlers["HwStartIo"] = func_ea
+        elif "BuildIo" in func_name or "HwBuildIo" in func_name:
+            handlers["HwBuildIo"] = func_ea
+        elif "ProcessServiceRequest" in func_name:
+            handlers["HwProcessServiceRequest"] = func_ea
+
+    # Search for StorPortInitialize calls and trace back to find callback assignments
+    for ea, name in _import_cache.items():
+        if "StorPortInitialize" in name:
+            # Find xrefs to StorPortInitialize
+            for xref in idautils.XrefsTo(ea):
+                func = ida_funcs.get_func(xref.frm)
+                if func:
+                    # The 3rd argument (r8) contains HW_INITIALIZATION_DATA pointer
+                    # Analyze the function to find callback assignments
+                    _analyze_hw_init_data(func.start_ea, handlers)
+
+    return handlers
+
+
+def _analyze_hw_init_data(func_ea: int, handlers: Dict[str, int]):
+    """Analyze function to find HW_INITIALIZATION_DATA callback assignments"""
+    func = ida_funcs.get_func(func_ea)
+    if not func:
+        return
+
+    # StorPort HW_INITIALIZATION_DATA callback offsets (x64)
+    # These vary by structure version but common offsets:
+    callback_offsets = {
+        0x08: "HwFindAdapter",
+        0x10: "HwInitialize",
+        0x18: "HwStartIo",
+        0x20: "HwInterrupt",
+        0x28: "HwResetBus",
+        0x30: "HwAdapterControl",
+        0x38: "HwBuildIo",
+        0x78: "HwProcessServiceRequest",
+        0x80: "HwCompleteServiceIrp",
+    }
+
+    for head in idautils.FuncItems(func_ea):
+        mnem = idc.print_insn_mnem(head)
+        if mnem in ["mov", "lea"]:
+            disasm = idc.GetDisasm(head)
+            # Look for patterns like mov [rbp+offset], func_addr
+            for offset, cb_name in callback_offsets.items():
+                if f"+{offset:X}h]" in disasm.upper() or f"+0x{offset:X}]" in disasm.upper():
+                    target = idc.get_operand_value(head, 1)
+                    if target and target != idc.BADADDR:
+                        func_at = ida_funcs.get_func(target)
+                        if func_at:
+                            handlers[cb_name] = target
+
+
+def _find_ndis_handlers() -> Dict[str, int]:
+    """Find NDIS miniport callback handlers"""
+    handlers = {}
+
+    # Search for NDIS callback patterns in function names
+    for func_ea in idautils.Functions():
+        func_name = idc.get_name(func_ea)
+        if not func_name:
+            continue
+
+        for cb_name in NDIS_CALLBACKS:
+            if cb_name.lower() in func_name.lower():
+                handlers[cb_name] = func_ea
+
+    return handlers
+
+
+def _find_wdf_handlers() -> Dict[str, int]:
+    """Find WDF callback handlers"""
+    handlers = {}
+
+    wdf_callbacks = [
+        "EvtDriverDeviceAdd", "EvtDevicePrepareHardware", "EvtDeviceReleaseHardware",
+        "EvtDeviceD0Entry", "EvtDeviceD0Exit", "EvtIoRead", "EvtIoWrite",
+        "EvtIoDeviceControl", "EvtIoInternalDeviceControl", "EvtIoDefault",
+        "EvtRequestCancel", "EvtFileCreate", "EvtFileClose", "EvtFileCleanup"
+    ]
+
+    for func_ea in idautils.Functions():
+        func_name = idc.get_name(func_ea)
+        if not func_name:
+            continue
+
+        for cb_name in wdf_callbacks:
+            if cb_name.lower() in func_name.lower():
+                handlers[cb_name] = func_ea
+
+    return handlers
+
+
+def _find_all_handlers() -> Dict[str, Any]:
+    """Find all entry points/handlers based on driver type"""
+    driver_info = _detect_driver_type()
+    handlers = {
+        "driver_type": driver_info["type"],
+        "dispatch_handlers": {},
+        "callbacks": {},
+        "ioctl_handlers": {}
+    }
+
+    # Always try to find standard dispatch handlers
+    for name in ["DriverEntry", "GsDriverEntry", "FxDriverEntry"]:
+        ea = idc.get_name_ea_simple(name)
+        if ea != idc.BADADDR:
+            handlers["dispatch_handlers"]["DriverEntry"] = ea
+            break
+
+    # Type-specific handler discovery
+    if driver_info["type"] == "storport":
+        handlers["callbacks"] = _find_storport_handlers()
+    elif driver_info["type"] == "ndis":
+        handlers["callbacks"] = _find_ndis_handlers()
+    elif driver_info["type"] == "wdf":
+        handlers["callbacks"] = _find_wdf_handlers()
+
+    # Find standard WDM dispatch handlers
+    driver_entry = handlers["dispatch_handlers"].get("DriverEntry")
+    if driver_entry:
+        func = ida_funcs.get_func(driver_entry)
+        if func:
+            for head in idautils.FuncItems(driver_entry):
+                mnem = idc.print_insn_mnem(head)
+                if mnem in ["mov", "lea"]:
+                    disasm = idc.GetDisasm(head)
+                    for irp_idx, irp_name in IRP_DISPATCH_NAMES.items():
+                        offset = 0x70 + (irp_idx * 8)
+                        if f"+{offset:X}h]".lower() in disasm.lower():
+                            handler = idc.get_operand_value(head, 1)
+                            if handler and handler != idc.BADADDR:
+                                handlers["dispatch_handlers"][irp_name] = handler
+
+    # Also search by function name patterns
+    dispatch_patterns = [
+        ("DispatchCreate", "IRP_MJ_CREATE"),
+        ("DispatchClose", "IRP_MJ_CLOSE"),
+        ("DispatchDeviceControl", "IRP_MJ_DEVICE_CONTROL"),
+        ("DispatchCleanup", "IRP_MJ_CLEANUP"),
+        ("DeviceControl", "IRP_MJ_DEVICE_CONTROL"),
+        ("DeviceIoControl", "IRP_MJ_DEVICE_CONTROL"),
+        ("InternalDeviceControl", "IRP_MJ_INTERNAL_DEVICE_CONTROL"),
+    ]
+
+    for func_ea in idautils.Functions():
+        func_name = idc.get_name(func_ea)
+        if func_name:
+            for pattern, irp_name in dispatch_patterns:
+                if pattern.lower() in func_name.lower():
+                    if irp_name not in handlers["dispatch_handlers"]:
+                        handlers["dispatch_handlers"][irp_name] = func_ea
+
+    return handlers
+
+
 # ============================================================
 # MCP Tools
 # ============================================================
@@ -180,10 +437,15 @@ def race_analyze() -> Dict[str, Any]:
 
     _build_import_cache()
 
+    # Use improved handler detection
+    handler_info = _find_all_handlers()
+
     results = {
+        "driver_type": handler_info["driver_type"],
         "globals": {},
-        "dispatch_handlers": {},
-        "ioctl_handlers": {},
+        "dispatch_handlers": {k: hex(v) if isinstance(v, int) else v for k, v in handler_info["dispatch_handlers"].items()},
+        "callbacks": {k: hex(v) if isinstance(v, int) else v for k, v in handler_info["callbacks"].items()},
+        "ioctl_handlers": {k: hex(v) if isinstance(v, int) else v for k, v in handler_info["ioctl_handlers"].items()},
         "shared_accesses": [],
         "race_candidates": [],
         "toctou_candidates": [],
@@ -197,58 +459,23 @@ def race_analyze() -> Dict[str, Any]:
         seg = ida_segment.getseg(seg_ea)
         seg_name = ida_segment.get_segm_name(seg)
 
-        if seg_name in [".data", ".bss", "DATA", "BSS"]:
+        if seg_name in [".data", ".bss", "DATA", "BSS", ".rdata"]:
             seg_end = ida_segment.get_segm_end(seg_ea)
             ea = seg_ea
 
             while ea < seg_end and ea != idc.BADADDR:
                 name = idc.get_name(ea)
-                if name and not name.startswith(("unk_", "byte_", "word_", "dword_", "qword_")):
+                if name and not name.startswith(("unk_", "byte_", "word_", "dword_", "qword_", "off_", "loc_")):
                     xref_count = len(list(idautils.XrefsTo(ea)))
                     if xref_count >= 2:
                         results["globals"][hex(ea)] = name
                 ea = idc.next_head(ea, seg_end)
 
-    # Find dispatch handlers
-    for name in ["DriverEntry", "GsDriverEntry", "FxDriverEntry"]:
-        driver_entry = idc.get_name_ea_simple(name)
-        if driver_entry != idc.BADADDR:
-            func = ida_funcs.get_func(driver_entry)
-            if func:
-                for head in idautils.FuncItems(driver_entry):
-                    mnem = idc.print_insn_mnem(head)
-                    if mnem in ["mov", "lea"]:
-                        disasm = idc.GetDisasm(head)
-                        for irp_idx, irp_name in IRP_DISPATCH_NAMES.items():
-                            offset = 0x70 + (irp_idx * 8)
-                            if f"+{offset:X}h]".lower() in disasm.lower():
-                                handler = idc.get_operand_value(head, 1)
-                                if handler and handler != idc.BADADDR:
-                                    results["dispatch_handlers"][irp_name] = hex(handler)
-            break
-
-    # Find by naming patterns
-    dispatch_patterns = [
-        ("DispatchCreate", "IRP_MJ_CREATE"),
-        ("DispatchClose", "IRP_MJ_CLOSE"),
-        ("DispatchDeviceControl", "IRP_MJ_DEVICE_CONTROL"),
-        ("DispatchCleanup", "IRP_MJ_CLEANUP"),
-        ("DeviceControl", "IRP_MJ_DEVICE_CONTROL"),
-    ]
-
-    for func_ea in idautils.Functions():
-        func_name = idc.get_name(func_ea)
-        if func_name:
-            for pattern, irp_name in dispatch_patterns:
-                if pattern.lower() in func_name.lower():
-                    if irp_name not in results["dispatch_handlers"]:
-                        results["dispatch_handlers"][irp_name] = hex(func_ea)
-
-    # Find IOCTL handlers
+    # Find IOCTL handlers from DeviceControl
     device_control = None
     for name, addr_hex in results["dispatch_handlers"].items():
         if "DEVICE_CONTROL" in name:
-            device_control = int(addr_hex, 16)
+            device_control = int(addr_hex, 16) if isinstance(addr_hex, str) else addr_hex
             break
 
     if device_control:
@@ -259,7 +486,7 @@ def race_analyze() -> Dict[str, Any]:
                     val = idc.get_operand_value(head, 1)
                     if val and val > 0x10000:
                         device_type = (val >> 16) & 0xFFFF
-                        if device_type in [0x22, 0x80, 0x12, 0x00, 0x83]:
+                        if device_type in [0x22, 0x80, 0x12, 0x00, 0x83, 0x84, 0xF0]:
                             next_head = idc.next_head(head, func.end_ea)
                             if next_head != idc.BADADDR:
                                 if idc.print_insn_mnem(next_head) in ["jz", "je", "jnz", "jne"]:
@@ -271,9 +498,21 @@ def race_analyze() -> Dict[str, Any]:
     analyzed_funcs = set()
     all_handlers = []
     for addr_hex in results["dispatch_handlers"].values():
-        all_handlers.append(int(addr_hex, 16))
+        try:
+            all_handlers.append(int(addr_hex, 16) if isinstance(addr_hex, str) else addr_hex)
+        except:
+            pass
     for addr_hex in results["ioctl_handlers"].values():
-        all_handlers.append(int(addr_hex, 16))
+        try:
+            all_handlers.append(int(addr_hex, 16) if isinstance(addr_hex, str) else addr_hex)
+        except:
+            pass
+    # Include driver-specific callbacks (StorPort, NDIS, WDF)
+    for addr_hex in results["callbacks"].values():
+        try:
+            all_handlers.append(int(addr_hex, 16) if isinstance(addr_hex, str) else addr_hex)
+        except:
+            pass
 
     def analyze_function(func_ea, locks_held, depth=4):
         if depth <= 0 or func_ea in analyzed_funcs:
@@ -510,8 +749,10 @@ def race_analyze() -> Dict[str, Any]:
     high = len([r for r in results["race_candidates"] if r["severity"] == "high"])
 
     results["summary"] = {
+        "driver_type": results.get("driver_type", "unknown"),
         "total_globals": len(results["globals"]),
         "total_dispatch_handlers": len(results["dispatch_handlers"]),
+        "total_callbacks": len(results.get("callbacks", {})),
         "total_ioctl_handlers": len(results["ioctl_handlers"]),
         "total_race_candidates": len(results["race_candidates"]),
         "critical_races": critical,
@@ -523,6 +764,51 @@ def race_analyze() -> Dict[str, Any]:
 
     _analysis_results = results
     return results
+
+
+@tool
+@ext("race")
+@idasync
+def race_detect_driver_type() -> Dict[str, Any]:
+    """Detect the type of driver being analyzed.
+
+    Identifies driver type from imports, strings, and patterns:
+    - storport: StorPort miniport drivers (storage)
+    - ndis: NDIS miniport drivers (network)
+    - wdf: Windows Driver Framework (KMDF/UMDF)
+    - filter: Filesystem filter drivers
+    - wdm: Standard WDM drivers
+
+    Returns driver type and indicators found.
+    """
+    _build_import_cache()
+    return _detect_driver_type()
+
+
+@tool
+@ext("race")
+@idasync
+def race_get_all_handlers() -> Dict[str, Any]:
+    """Get all detected handlers/callbacks for the driver.
+
+    Returns handlers based on driver type including:
+    - WDM dispatch handlers (IRP_MJ_*)
+    - StorPort callbacks (HwStartIo, HwBuildIo, etc.)
+    - NDIS callbacks (MiniportOidRequest, etc.)
+    - WDF callbacks (EvtIoDeviceControl, etc.)
+    """
+    _build_import_cache()
+    handlers = _find_all_handlers()
+
+    # Convert addresses to hex strings
+    result = {
+        "driver_type": handlers["driver_type"],
+        "dispatch_handlers": {k: hex(v) if isinstance(v, int) else v for k, v in handlers["dispatch_handlers"].items()},
+        "callbacks": {k: hex(v) if isinstance(v, int) else v for k, v in handlers["callbacks"].items()},
+        "ioctl_handlers": {k: hex(v) if isinstance(v, int) else v for k, v in handlers["ioctl_handlers"].items()},
+    }
+
+    return result
 
 
 @tool
